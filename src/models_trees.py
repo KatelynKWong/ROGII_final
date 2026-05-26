@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 import json
 import sys
@@ -12,12 +13,20 @@ from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegr
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
 
-if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
+try:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.pipeline import AbstractBaseModel, FeaturePipeline
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
 
 
 try:  # pragma: no cover - optional dependency
@@ -78,7 +87,7 @@ class TreeEnsembleModel(AbstractBaseModel):
         self.scale_target = bool(scale_target)
         self.random_state = int(random_state)
         self.fast_debug = bool(fast_debug)
-        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.metrics_path = _resolve_path(metrics_path) if metrics_path else None
 
         self.feature_pipeline = feature_pipeline or FeaturePipeline(
             group_col=group_col,
@@ -302,10 +311,12 @@ class TreeEnsembleModel(AbstractBaseModel):
             name="lightgbm",
             implementation="lightgbm.LGBMRegressor" if lgb is not None else "sklearn.HistGradientBoostingRegressor",
             params={
-                "n_estimators": 200,
+                "n_estimators": 180,
                 "learning_rate": 0.05,
-                "max_depth": -1,
+                "max_depth": 6,
                 "num_leaves": 31,
+                "max_bin": 255,
+                "n_jobs": -1,
                 "random_state": self.random_state,
             },
         )
@@ -313,9 +324,11 @@ class TreeEnsembleModel(AbstractBaseModel):
             name="catboost",
             implementation="catboost.CatBoostRegressor" if cb is not None else "sklearn.GradientBoostingRegressor",
             params={
-                "iterations": 250,
+                "iterations": 220,
                 "learning_rate": 0.05,
                 "depth": 6,
+                "border_count": 255,
+                "thread_count": -1,
                 "loss_function": "RMSE",
                 "random_seed": self.random_state,
                 "verbose": False,
@@ -325,11 +338,14 @@ class TreeEnsembleModel(AbstractBaseModel):
             name="xgboost",
             implementation="xgboost.XGBRegressor" if xgb is not None else "sklearn.GradientBoostingRegressor",
             params={
-                "n_estimators": 250,
+                "n_estimators": 220,
                 "learning_rate": 0.05,
-                "max_depth": 4,
+                "max_depth": 6,
                 "subsample": 0.9,
                 "colsample_bytree": 0.9,
+                "max_bin": 255,
+                "tree_method": "hist",
+                "n_jobs": -1,
                 "random_state": self.random_state,
             },
         )
@@ -351,6 +367,7 @@ class TreeEnsembleModel(AbstractBaseModel):
             return HistGradientBoostingRegressor(
                 learning_rate=params["learning_rate"],
                 max_depth=6,
+                max_bins=255,
                 max_leaf_nodes=31,
                 min_samples_leaf=20,
                 random_state=self.random_state,
@@ -359,13 +376,13 @@ class TreeEnsembleModel(AbstractBaseModel):
             return GradientBoostingRegressor(
                 n_estimators=params["iterations"],
                 learning_rate=params["learning_rate"],
-                max_depth=3,
+                max_depth=6,
                 random_state=self.random_state,
             )
         return GradientBoostingRegressor(
             n_estimators=params["n_estimators"],
             learning_rate=params["learning_rate"],
-            max_depth=4,
+            max_depth=6,
             random_state=self.random_state,
             subsample=0.9,
         )
@@ -444,6 +461,7 @@ class TreeEnsembleModel(AbstractBaseModel):
                 existing = []
 
         existing.append(summary)
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.metrics_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
 

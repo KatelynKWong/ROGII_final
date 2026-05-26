@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -11,16 +12,33 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
 
-if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
-    ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-
 from src.pipeline import AbstractBaseModel, FeaturePipeline
 
 import torch  # type: ignore
 import torch.nn as nn  # type: ignore
 from torch.utils.data import DataLoader, TensorDataset  # type: ignore
+
+
+try:  # pragma: no cover - direct execution shim
+    ROOT = Path(__file__).resolve().parents[1]
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
+
+
+def _select_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # type: ignore[attr-defined]
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 class _BiLSTMNet(nn.Module):
@@ -56,7 +74,7 @@ class _TorchSequenceRegressor:
         random_state: int,
     ) -> None:
         torch.manual_seed(random_state)
-        self.device = torch.device("cpu")
+        self.device = _select_device()
         self.net = _BiLSTMNet(input_size=input_size, hidden_size=hidden_size).to(self.device)
         self.learning_rate = learning_rate
         self.batch_size = batch_size
@@ -134,7 +152,7 @@ class DeepSequenceModel(AbstractBaseModel):
         self.scale_target = bool(scale_target)
         self.architecture = architecture
         self.random_state = int(random_state)
-        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.metrics_path = _resolve_path(metrics_path) if metrics_path else None
 
         self.feature_pipeline = feature_pipeline or FeaturePipeline(
             group_col=group_col,
@@ -424,6 +442,7 @@ class DeepSequenceModel(AbstractBaseModel):
                 existing = []
 
         existing.append(summary)
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.metrics_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
 

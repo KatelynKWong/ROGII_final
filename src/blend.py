@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +15,13 @@ from scipy.optimize import minimize
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
 
-if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
+try:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.pipeline import FeaturePipeline
 from src.models_baselines import BaselineEnsembleModel
@@ -29,11 +33,16 @@ from src.models_tabnet import DeepTabularModel
 from src.models_trees import TreeEnsembleModel
 
 
-ARTIFACT_DIR = Path("artifacts/blend")
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
+
+
+ARTIFACT_DIR = ROOT / "artifacts" / "blend"
 OOF_CACHE_PATH = ARTIFACT_DIR / "oof_cache.npz"
 OOF_META_PATH = ARTIFACT_DIR / "oof_cache.json"
 WEIGHTS_PATH = ARTIFACT_DIR / "meta_weights.json"
-SUBMISSION_PATH = Path("submission.csv")
+SUBMISSION_PATH = ROOT / "submission.csv"
 
 
 @dataclass(frozen=True)
@@ -276,7 +285,7 @@ def collect_peer_oof_matrix(family_models: Dict[str, Any]) -> Tuple[np.ndarray, 
 
 
 def save_oof_cache(cache_dir: str | Path, oof_matrix: np.ndarray, target_scaled: np.ndarray, peer_names: Sequence[str]) -> None:
-    cache_path = Path(cache_dir)
+    cache_path = _resolve_path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         cache_path / "oof_cache.npz",
@@ -290,7 +299,7 @@ def save_oof_cache(cache_dir: str | Path, oof_matrix: np.ndarray, target_scaled:
 
 
 def load_oof_cache(cache_dir: str | Path) -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
-    cache_file = Path(cache_dir) / "oof_cache.npz"
+    cache_file = _resolve_path(cache_dir) / "oof_cache.npz"
     if not cache_file.exists():
         return None
     data = np.load(cache_file, allow_pickle=True)
@@ -385,9 +394,9 @@ def collect_test_peer_matrix(family_models: Dict[str, Any], test_df: pd.DataFram
 def build_submission_from_predictions(
     test_frames: Dict[str, Dict[str, pd.DataFrame]],
     predictions_by_id: Dict[str, float],
-    sample_submission_path: str | Path = "data/sample_submission.csv",
+    sample_submission_path: str | Path = ROOT / "data" / "sample_submission.csv",
 ) -> pd.DataFrame:
-    sample = pd.read_csv(sample_submission_path)
+    sample = pd.read_csv(_resolve_path(sample_submission_path))
     missing = [identifier for identifier in sample["id"].tolist() if identifier not in predictions_by_id]
     if missing:
         raise RuntimeError(f"Missing predictions for {len(missing)} submission ids.")
@@ -400,8 +409,8 @@ def build_submission_from_predictions(
     return submission
 
 
-def append_metrics(record: Dict[str, Any], metrics_path: str | Path = "metrics.json") -> None:
-    path = Path(metrics_path)
+def append_metrics(record: Dict[str, Any], metrics_path: str | Path = ROOT / "metrics.json") -> None:
+    path = _resolve_path(metrics_path)
     existing: List[Dict[str, Any]] = []
     if path.exists():
         try:
@@ -413,19 +422,26 @@ def append_metrics(record: Dict[str, Any], metrics_path: str | Path = "metrics.j
         except json.JSONDecodeError:
             existing = []
     existing.append(record)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
 
 def run_blending(
-    train_root: str | Path = "data/train",
-    test_root: str | Path = "data/test",
+    train_root: str | Path = ROOT / "data" / "train",
+    test_root: str | Path = ROOT / "data" / "test",
     cache_dir: str | Path = ARTIFACT_DIR,
     submission_path: str | Path = SUBMISSION_PATH,
-    sample_submission_path: str | Path = "data/sample_submission.csv",
+    sample_submission_path: str | Path = ROOT / "data" / "sample_submission.csv",
     max_wells: Optional[int] = 6,
     row_cap: Optional[int] = 500,
     force_recompute_cache: bool = False,
 ) -> Dict[str, Any]:
+    train_root = _resolve_path(train_root)
+    test_root = _resolve_path(test_root)
+    cache_dir = _resolve_path(cache_dir)
+    submission_path = _resolve_path(submission_path)
+    sample_submission_path = _resolve_path(sample_submission_path)
+
     train_frames = load_competition_frames(train_root)
     test_frames = load_competition_frames(test_root)
 
@@ -469,7 +485,7 @@ def run_blending(
         predictions_by_id.update({identifier: float(pred) for identifier, pred in zip(well_ids, well_preds)})
 
     submission = build_submission_from_predictions(test_frames, predictions_by_id, sample_submission_path=sample_submission_path)
-    Path(submission_path).parent.mkdir(parents=True, exist_ok=True)
+    submission_path.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(submission_path, index=False)
 
     metrics_record = {
@@ -483,7 +499,7 @@ def run_blending(
         "submission_path": str(Path(submission_path).resolve()),
         "cache_dir": str(Path(cache_dir).resolve()),
     }
-    append_metrics(metrics_record, metrics_path="metrics.json")
+    append_metrics(metrics_record, metrics_path=ROOT / "metrics.json")
 
     return {
         "family_models": family_models,
@@ -496,11 +512,11 @@ def run_blending(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optimize stacked ensemble weights and write submission.csv.")
-    parser.add_argument("--train-root", default="data/train")
-    parser.add_argument("--test-root", default="data/test")
+    parser.add_argument("--train-root", default=str(ROOT / "data" / "train"))
+    parser.add_argument("--test-root", default=str(ROOT / "data" / "test"))
     parser.add_argument("--cache-dir", default=str(ARTIFACT_DIR))
     parser.add_argument("--submission-path", default=str(SUBMISSION_PATH))
-    parser.add_argument("--sample-submission-path", default="data/sample_submission.csv")
+    parser.add_argument("--sample-submission-path", default=str(ROOT / "data" / "sample_submission.csv"))
     parser.add_argument("--max-wells", type=int, default=6)
     parser.add_argument("--row-cap", type=int, default=500)
     parser.add_argument("--force-recompute-cache", action="store_true")

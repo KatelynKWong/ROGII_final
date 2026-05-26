@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import json
 import math
+import sys
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from pathlib import Path
@@ -10,6 +12,20 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
+
+
+try:  # pragma: no cover - direct execution shim
+    ROOT = Path(__file__).resolve().parents[1]
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
 
 
 FAST_DEBUG = False
@@ -338,7 +354,7 @@ class ExperimentOrchestrator:
         fast_debug: bool = FAST_DEBUG,
         fast_debug_well_count: int = 10,
         random_state: int = 42,
-        metrics_path: str | Path = "metrics.json",
+        metrics_path: str | Path = ROOT / "metrics.json",
     ) -> None:
         self.models: Dict[str, AbstractBaseModel] = dict(models or {})
         self.feature_pipeline = feature_pipeline or FeaturePipeline()
@@ -346,7 +362,7 @@ class ExperimentOrchestrator:
         self.fast_debug = bool(fast_debug)
         self.fast_debug_well_count = int(fast_debug_well_count)
         self.random_state = int(random_state)
-        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.metrics_path = _resolve_path(metrics_path) if metrics_path else None
 
         self.oof_predictions_: Dict[str, np.ndarray] = {}
         self.fold_models_: Dict[str, List[AbstractBaseModel]] = {}
@@ -553,7 +569,7 @@ if __name__ == "__main__":
         feature_pipeline=FeaturePipeline(),
         n_splits=5,
         fast_debug=False,
-        metrics_path=Path("metrics.json"),
+        metrics_path=ROOT / "metrics.json",
     )
 
     cv_result = orchestrator.cross_validate(mock_df)

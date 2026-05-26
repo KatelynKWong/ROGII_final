@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -12,26 +13,34 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVR
+from sklearn.svm import LinearSVR
 from tqdm.auto import tqdm
 
-if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
+try:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.pipeline import AbstractBaseModel, FeaturePipeline
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
 
 
 @dataclass(frozen=True)
 class _BackendSpec:
     name: str
-    kernel: str
     c: float
     epsilon: float
-    gamma: str | float = "scale"
-    degree: int = 3
-    coef0: float = 0.0
+    loss: str = "squared_epsilon_insensitive"
+    max_iter: int = 10000
+    dual: bool = False
+    random_state: int = 42
 
 
 class KernelMachineModel(AbstractBaseModel):
@@ -61,7 +70,7 @@ class KernelMachineModel(AbstractBaseModel):
         self.n_splits = int(n_splits)
         self.scale_target = bool(scale_target)
         self.random_state = int(random_state)
-        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.metrics_path = _resolve_path(metrics_path) if metrics_path else None
 
         self.feature_pipeline = feature_pipeline or FeaturePipeline(
             group_col=group_col,
@@ -303,22 +312,21 @@ class KernelMachineModel(AbstractBaseModel):
 
     def _default_backend_specs(self) -> Dict[str, _BackendSpec]:
         return {
-            "svr_rbf": _BackendSpec(name="svr_rbf", kernel="rbf", c=15.0, epsilon=0.05, gamma="scale"),
-            "svr_linear": _BackendSpec(name="svr_linear", kernel="linear", c=5.0, epsilon=0.1),
+            "svr_rbf": _BackendSpec(name="svr_rbf", c=1.0, epsilon=0.05, max_iter=10000, dual=False, random_state=self.random_state),
+            "svr_linear": _BackendSpec(name="svr_linear", c=1.0, epsilon=0.1, max_iter=10000, dual=False, random_state=self.random_state),
         }
 
     def _make_estimator(self, backend_name: str) -> Any:
         spec = self.backend_specs_[backend_name]
-        model = SVR(
-            kernel=spec.kernel,
+        model = LinearSVR(
             C=spec.c,
             epsilon=spec.epsilon,
-            gamma=spec.gamma,
-            degree=spec.degree,
-            coef0=spec.coef0,
-            cache_size=512,
+            loss=spec.loss,
+            dual=spec.dual,
+            max_iter=spec.max_iter,
+            random_state=spec.random_state,
         )
-        # SVR is distance-sensitive, so every fold uses an independent scaler.
+        # LinearSVR is still scale-sensitive, so every fold uses an independent scaler.
         return make_pipeline(StandardScaler(), model)
 
     def _serializable_model_state(self, estimator: Any) -> Dict[str, Any]:
@@ -360,6 +368,7 @@ class KernelMachineModel(AbstractBaseModel):
                 existing = []
 
         existing.append(summary)
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.metrics_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,12 +14,20 @@ from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor,
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
 
-if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
+try:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+except NameError:  # pragma: no cover - notebook execution shim
+    ROOT = Path(os.getcwd()).resolve()
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.pipeline import AbstractBaseModel, FeaturePipeline
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else ROOT / candidate
 
 
 @dataclass(frozen=True)
@@ -56,7 +65,7 @@ class BaselineEnsembleModel(AbstractBaseModel):
         self.n_splits = int(n_splits)
         self.scale_target = bool(scale_target)
         self.random_state = int(random_state)
-        self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.metrics_path = _resolve_path(metrics_path) if metrics_path else None
 
         self.feature_pipeline = feature_pipeline or FeaturePipeline(
             group_col=group_col,
@@ -369,6 +378,7 @@ class BaselineEnsembleModel(AbstractBaseModel):
                 existing = []
 
         existing.append(summary)
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         self.metrics_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
 
 
