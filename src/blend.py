@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from sklearn.model_selection import GroupKFold
+from tqdm.auto import tqdm
 
 if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
@@ -197,46 +198,42 @@ def _make_light_tree_model(random_state: int = 42) -> TreeEnsembleModel:
 def fit_family_models(train_df: pd.DataFrame) -> Dict[str, Any]:
     family_models: Dict[str, Any] = {}
 
-    tree_model = _make_light_tree_model()
-    tree_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["tree"] = tree_model
+    family_steps = [
+        ("Family A", "tree", lambda: _make_light_tree_model().fit(train_df, train_df["TVT"].to_numpy())),
+        (
+            "Family B",
+            "sequence",
+            lambda: DeepSequenceModel(
+                metrics_path=None,
+                sequence_length=8,
+                hidden_size=16,
+                epochs=2,
+                batch_size=64,
+                learning_rate=1e-3,
+            ).fit(train_df, train_df["TVT"].to_numpy()),
+        ),
+        ("Family D", "spatial", lambda: SpatialNeighborModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family E", "kernels", lambda: KernelMachineModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        (
+            "Family F",
+            "tabular",
+            lambda: DeepTabularModel(
+                metrics_path=None,
+                hidden_dims=(64, 32),
+                epochs=2,
+                batch_size=64,
+                learning_rate=1e-3,
+            ).fit(train_df, train_df["TVT"].to_numpy()),
+        ),
+        ("Family C", "linear", lambda: LinearEnsembleModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family G", "baseline", lambda: BaselineEnsembleModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+    ]
 
-    sequence_model = DeepSequenceModel(
-        metrics_path=None,
-        sequence_length=8,
-        hidden_size=16,
-        epochs=2,
-        batch_size=64,
-        learning_rate=1e-3,
-    )
-    sequence_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["sequence"] = sequence_model
-
-    spatial_model = SpatialNeighborModel(metrics_path=None)
-    spatial_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["spatial"] = spatial_model
-
-    kernel_model = KernelMachineModel(metrics_path=None)
-    kernel_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["kernels"] = kernel_model
-
-    tabular_model = DeepTabularModel(
-        metrics_path=None,
-        hidden_dims=(64, 32),
-        epochs=2,
-        batch_size=64,
-        learning_rate=1e-3,
-    )
-    tabular_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["tabular"] = tabular_model
-
-    linear_model = LinearEnsembleModel(metrics_path=None)
-    linear_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["linear"] = linear_model
-
-    baseline_model = BaselineEnsembleModel(metrics_path=None)
-    baseline_model.fit(train_df, train_df["TVT"].to_numpy())
-    family_models["baseline"] = baseline_model
+    with tqdm(total=len(family_steps), desc="Training 7 model families", dynamic_ncols=True) as family_bar:
+        for family_label, family_key, trainer in family_steps:
+            family_bar.set_description(f"Training {family_label}")
+            family_models[family_key] = trainer()
+            family_bar.update(1)
 
     return family_models
 
@@ -245,38 +242,34 @@ def collect_peer_oof_matrix(family_models: Dict[str, Any]) -> Tuple[np.ndarray, 
     columns: List[np.ndarray] = []
     names: List[str] = []
 
-    tree_model = family_models["tree"]
-    for backend in tree_model.BACKEND_ORDER:
-        columns.append(np.asarray(tree_model.scaled_oof_predictions_[backend], dtype=float))
-        names.append(f"tree_{backend}")
-
-    sequence_model = family_models["sequence"]
-    columns.append(np.asarray(sequence_model.oof_predictions_sequence_scaled, dtype=float))
-    names.append("sequence_bilstm")
-
-    spatial_model = family_models["spatial"]
-    for backend in spatial_model.BACKEND_ORDER:
-        columns.append(np.asarray(spatial_model.scaled_oof_predictions_[backend], dtype=float))
-        names.append(f"spatial_{backend}")
-
-    kernel_model = family_models["kernels"]
-    for backend in kernel_model.BACKEND_ORDER:
-        columns.append(np.asarray(kernel_model.scaled_oof_predictions_[backend], dtype=float))
-        names.append(f"kernels_{backend}")
-
-    tabular_model = family_models["tabular"]
-    columns.append(np.asarray(tabular_model.scaled_oof_predictions_tabular_mlp, dtype=float))
-    names.append("tabular_mlp")
-
-    linear_model = family_models["linear"]
-    for backend in linear_model.BACKEND_ORDER:
-        columns.append(np.asarray(linear_model.scaled_oof_predictions_[backend], dtype=float))
-        names.append(f"linear_{backend}")
-
-    baseline_model = family_models["baseline"]
-    for backend in baseline_model.BACKEND_ORDER:
-        columns.append(np.asarray(baseline_model.scaled_oof_predictions_[backend], dtype=float))
-        names.append(f"baseline_{backend}")
+    with tqdm(total=len(PEER_SPECS), desc="Collecting 16 peer OOF columns", dynamic_ncols=True) as peer_bar:
+        for spec in PEER_SPECS:
+            peer_bar.set_description(f"Collecting {spec.display_name}")
+            if spec.family == "tree":
+                model = family_models["tree"]
+                columns.append(np.asarray(model.scaled_oof_predictions_[spec.backend], dtype=float))
+            elif spec.family == "sequence":
+                model = family_models["sequence"]
+                columns.append(np.asarray(model.oof_predictions_sequence_scaled, dtype=float))
+            elif spec.family == "spatial":
+                model = family_models["spatial"]
+                columns.append(np.asarray(model.scaled_oof_predictions_[spec.backend], dtype=float))
+            elif spec.family == "kernels":
+                model = family_models["kernels"]
+                columns.append(np.asarray(model.scaled_oof_predictions_[spec.backend], dtype=float))
+            elif spec.family == "tabular":
+                model = family_models["tabular"]
+                columns.append(np.asarray(model.scaled_oof_predictions_tabular_mlp, dtype=float))
+            elif spec.family == "linear":
+                model = family_models["linear"]
+                columns.append(np.asarray(model.scaled_oof_predictions_[spec.backend], dtype=float))
+            elif spec.family == "baseline":
+                model = family_models["baseline"]
+                columns.append(np.asarray(model.scaled_oof_predictions_[spec.backend], dtype=float))
+            else:
+                raise KeyError(f"Unknown family '{spec.family}'.")
+            names.append(spec.display_name)
+            peer_bar.update(1)
 
     matrix = np.column_stack(columns)
     return matrix, names
@@ -356,36 +349,35 @@ def predict_family_scaled(model: Any, family_name: str, df: pd.DataFrame) -> np.
 def collect_test_peer_matrix(family_models: Dict[str, Any], test_df: pd.DataFrame) -> np.ndarray:
     columns: List[np.ndarray] = []
 
-    tree_model = family_models["tree"]
-    tree_preds = predict_family_scaled(tree_model, "tree", test_df)
-    for idx in range(tree_preds.shape[1]):
-        columns.append(tree_preds[:, idx])
+    with tqdm(total=len(PEER_SPECS), desc="Collecting 16 peer test columns", dynamic_ncols=True) as peer_bar:
+        for spec in PEER_SPECS:
+            peer_bar.set_description(f"Collecting {spec.display_name}")
+            if spec.family == "tree":
+                model = family_models["tree"]
+                pred = predict_family_scaled(model, "tree", test_df)[:, [list(model.BACKEND_ORDER).index(spec.backend)]]
+            elif spec.family == "sequence":
+                model = family_models["sequence"]
+                pred = predict_family_scaled(model, "sequence", test_df)
+            elif spec.family == "spatial":
+                model = family_models["spatial"]
+                pred = predict_family_scaled(model, "spatial", test_df)[:, [list(model.BACKEND_ORDER).index(spec.backend)]]
+            elif spec.family == "kernels":
+                model = family_models["kernels"]
+                pred = predict_family_scaled(model, "kernels", test_df)[:, [list(model.BACKEND_ORDER).index(spec.backend)]]
+            elif spec.family == "tabular":
+                model = family_models["tabular"]
+                pred = predict_family_scaled(model, "tabular", test_df)
+            elif spec.family == "linear":
+                model = family_models["linear"]
+                pred = predict_family_scaled(model, "linear", test_df)[:, [list(model.BACKEND_ORDER).index(spec.backend)]]
+            elif spec.family == "baseline":
+                model = family_models["baseline"]
+                pred = predict_family_scaled(model, "baseline", test_df)[:, [list(model.BACKEND_ORDER).index(spec.backend)]]
+            else:
+                raise KeyError(f"Unknown family '{spec.family}'.")
 
-    sequence_model = family_models["sequence"]
-    columns.append(predict_family_scaled(sequence_model, "sequence", test_df).reshape(-1))
-
-    spatial_model = family_models["spatial"]
-    spatial_preds = predict_family_scaled(spatial_model, "spatial", test_df)
-    for idx in range(spatial_preds.shape[1]):
-        columns.append(spatial_preds[:, idx])
-
-    kernel_model = family_models["kernels"]
-    kernel_preds = predict_family_scaled(kernel_model, "kernels", test_df)
-    for idx in range(kernel_preds.shape[1]):
-        columns.append(kernel_preds[:, idx])
-
-    tabular_model = family_models["tabular"]
-    columns.append(predict_family_scaled(tabular_model, "tabular", test_df).reshape(-1))
-
-    linear_model = family_models["linear"]
-    linear_preds = predict_family_scaled(linear_model, "linear", test_df)
-    for idx in range(linear_preds.shape[1]):
-        columns.append(linear_preds[:, idx])
-
-    baseline_model = family_models["baseline"]
-    baseline_preds = predict_family_scaled(baseline_model, "baseline", test_df)
-    for idx in range(baseline_preds.shape[1]):
-        columns.append(baseline_preds[:, idx])
+            columns.append(np.asarray(pred, dtype=float).reshape(-1))
+            peer_bar.update(1)
 
     return np.column_stack(columns)
 

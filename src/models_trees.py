@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.model_selection import GroupKFold
+from tqdm.auto import tqdm
 
 if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,12 @@ class TreeEnsembleModel(AbstractBaseModel):
     """
 
     BACKEND_ORDER = ("lightgbm", "catboost", "xgboost")
+    FAMILY_LABEL = "Family A"
+    BACKEND_DISPLAY_NAMES = {
+        "lightgbm": "LightGBM",
+        "catboost": "CatBoost",
+        "xgboost": "XGBoost",
+    }
 
     def __init__(
         self,
@@ -110,6 +117,8 @@ class TreeEnsembleModel(AbstractBaseModel):
 
         splitter = GroupKFold(n_splits=min(self.n_splits, len(np.unique(groups))))
         indices = np.arange(len(feature_frame))
+        folds = list(splitter.split(indices, groups=groups))
+        n_folds = len(folds)
 
         self.backend_specs_ = self._build_backend_specs()
         self.hyperparameter_log_ = []
@@ -122,46 +131,57 @@ class TreeEnsembleModel(AbstractBaseModel):
         for backend_name in self.BACKEND_ORDER:
             backend_scaled_oof = np.full(len(feature_frame), np.nan, dtype=float)
             backend_original_oof = np.full(len(feature_frame), np.nan, dtype=float)
+            backend_display = self.BACKEND_DISPLAY_NAMES.get(backend_name, backend_name)
 
-            for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(indices, groups=groups)):
-                X_train = feature_frame.iloc[train_idx]
-                X_val = feature_frame.iloc[val_idx]
-                y_train = target_scaled[train_idx]
-                y_val_original = target[val_idx]
+            with tqdm(
+                total=n_folds,
+                desc=f"Training {self.FAMILY_LABEL}: {backend_display}",
+                dynamic_ncols=True,
+                leave=False,
+            ) as fold_bar:
+                for fold_idx, (train_idx, val_idx) in enumerate(folds):
+                    fold_bar.set_description(
+                        f"Training {self.FAMILY_LABEL}: {backend_display} | Fold {fold_idx + 1}/{n_folds}"
+                    )
+                    X_train = feature_frame.iloc[train_idx]
+                    X_val = feature_frame.iloc[val_idx]
+                    y_train = target_scaled[train_idx]
+                    y_val_original = target[val_idx]
 
-                fit_result = self._fit_single_backend(
-                    backend_name=backend_name,
-                    X_train=X_train,
-                    y_train=y_train,
-                    X_val=X_val,
-                    fold_index=fold_idx,
-                )
+                    fit_result = self._fit_single_backend(
+                        backend_name=backend_name,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        fold_index=fold_idx,
+                    )
 
-                scaled_pred = fit_result["val_pred_scaled"]
-                original_pred = self._unscale_target(scaled_pred)
+                    scaled_pred = fit_result["val_pred_scaled"]
+                    original_pred = self._unscale_target(scaled_pred)
 
-                backend_scaled_oof[val_idx] = scaled_pred
-                backend_original_oof[val_idx] = original_pred
+                    backend_scaled_oof[val_idx] = scaled_pred
+                    backend_original_oof[val_idx] = original_pred
 
-                fold_rmse = float(np.sqrt(np.mean((original_pred - y_val_original) ** 2)))
-                self.fold_scores_[backend_name].append(fold_rmse)
-                self.fold_models_[backend_name].append(fit_result["model"])
-                self.backend_feature_importance_[backend_name].append(
-                    {
-                        "fold_index": fold_idx,
-                        "feature_importance": fit_result["feature_importance"],
-                        "fold_rmse": fold_rmse,
-                    }
-                )
-                self.hyperparameter_log_.append(
-                    {
-                        "backend": backend_name,
-                        "fold_index": fold_idx,
-                        "implementation": self.backend_specs_[backend_name].implementation,
-                        "hyperparameters": self._serializable_params(fit_result["model"]),
-                        "fold_rmse": fold_rmse,
-                    }
-                )
+                    fold_rmse = float(np.sqrt(np.mean((original_pred - y_val_original) ** 2)))
+                    self.fold_scores_[backend_name].append(fold_rmse)
+                    self.fold_models_[backend_name].append(fit_result["model"])
+                    self.backend_feature_importance_[backend_name].append(
+                        {
+                            "fold_index": fold_idx,
+                            "feature_importance": fit_result["feature_importance"],
+                            "fold_rmse": fold_rmse,
+                        }
+                    )
+                    self.hyperparameter_log_.append(
+                        {
+                            "backend": backend_name,
+                            "fold_index": fold_idx,
+                            "implementation": self.backend_specs_[backend_name].implementation,
+                            "hyperparameters": self._serializable_params(fit_result["model"]),
+                            "fold_rmse": fold_rmse,
+                        }
+                    )
+                    fold_bar.update(1)
 
             if np.isnan(backend_original_oof).any():
                 raise RuntimeError(f"OOF predictions for '{backend_name}' were not filled for every training row.")

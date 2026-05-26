@@ -13,6 +13,7 @@ import torch.nn as nn
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
 
 if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,9 @@ class _TorchTabularRegressor:
 class DeepTabularModel(AbstractBaseModel):
     """PyTorch MLP for well-level tabular TVT regression."""
 
+    FAMILY_LABEL = "Family F"
+    BACKEND_DISPLAY_NAME = "Tabular MLP"
+
     def __init__(
         self,
         feature_pipeline: Optional[FeaturePipeline] = None,
@@ -158,6 +162,8 @@ class DeepTabularModel(AbstractBaseModel):
 
         splitter = GroupKFold(n_splits=min(self.n_splits, n_unique_groups))
         indices = np.arange(len(df))
+        folds = list(splitter.split(indices, groups=groups))
+        n_folds = len(folds)
 
         oof_scaled = np.full(len(df), np.nan, dtype=float)
         oof_original = np.full(len(df), np.nan, dtype=float)
@@ -165,53 +171,63 @@ class DeepTabularModel(AbstractBaseModel):
         self.fold_models_ = []
         self.fold_scores_ = []
 
-        for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(indices, groups=groups)):
-            train_df = df.iloc[train_idx].copy()
-            val_df = df.iloc[val_idx].copy()
-            y_train = target[train_idx]
-            y_val = target[val_idx]
+        with tqdm(
+            total=n_folds,
+            desc=f"Training {self.FAMILY_LABEL}: {self.BACKEND_DISPLAY_NAME}",
+            dynamic_ncols=True,
+            leave=False,
+        ) as fold_bar:
+            for fold_idx, (train_idx, val_idx) in enumerate(folds):
+                fold_bar.set_description(
+                    f"Training {self.FAMILY_LABEL}: {self.BACKEND_DISPLAY_NAME} | Fold {fold_idx + 1}/{n_folds}"
+                )
+                train_df = df.iloc[train_idx].copy()
+                val_df = df.iloc[val_idx].copy()
+                y_train = target[train_idx]
+                y_val = target[val_idx]
 
-            fold_pipeline = deepcopy(self.feature_pipeline)
-            fold_pipeline.scale_target = self.scale_target
-            fold_pipeline.fit(train_df, y=y_train)
+                fold_pipeline = deepcopy(self.feature_pipeline)
+                fold_pipeline.scale_target = self.scale_target
+                fold_pipeline.fit(train_df, y=y_train)
 
-            train_features = self._build_numeric_features(fold_pipeline, train_df)
-            val_features = self._build_numeric_features(
-                fold_pipeline,
-                val_df,
-                reference_columns=train_features.columns,
-            )
+                train_features = self._build_numeric_features(fold_pipeline, train_df)
+                val_features = self._build_numeric_features(
+                    fold_pipeline,
+                    val_df,
+                    reference_columns=train_features.columns,
+                )
 
-            feature_scaler = StandardScaler()
-            train_features_scaled = feature_scaler.fit_transform(train_features)
-            val_features_scaled = feature_scaler.transform(val_features)
+                feature_scaler = StandardScaler()
+                train_features_scaled = feature_scaler.fit_transform(train_features)
+                val_features_scaled = feature_scaler.transform(val_features)
 
-            y_train_scaled = self._scale_target(y_train, pipeline=fold_pipeline)
-            backend = self._make_backend(
-                input_dim=train_features_scaled.shape[1],
-                seed=self.random_state + fold_idx,
-            )
-            backend.fit(train_features_scaled, y_train_scaled)
+                y_train_scaled = self._scale_target(y_train, pipeline=fold_pipeline)
+                backend = self._make_backend(
+                    input_dim=train_features_scaled.shape[1],
+                    seed=self.random_state + fold_idx,
+                )
+                backend.fit(train_features_scaled, y_train_scaled)
 
-            val_pred_scaled = backend.predict(val_features_scaled)
-            val_pred = fold_pipeline.inverse_transform_target(val_pred_scaled)
+                val_pred_scaled = backend.predict(val_features_scaled)
+                val_pred = fold_pipeline.inverse_transform_target(val_pred_scaled)
 
-            oof_scaled[val_idx] = val_pred_scaled
-            oof_original[val_idx] = val_pred
+                oof_scaled[val_idx] = val_pred_scaled
+                oof_original[val_idx] = val_pred
 
-            fold_rmse = float(np.sqrt(np.mean((val_pred - y_val) ** 2)))
-            self.fold_scores_.append(fold_rmse)
-            self.fold_models_.append(
-                {
-                    "fold_index": fold_idx,
-                    "pipeline": fold_pipeline,
-                    "feature_scaler": feature_scaler,
-                    "backend": backend,
-                    "feature_columns": list(train_features.columns),
-                    "fold_rmse": fold_rmse,
-                    "backend_state": backend.get_state(),
-                }
-            )
+                fold_rmse = float(np.sqrt(np.mean((val_pred - y_val) ** 2)))
+                self.fold_scores_.append(fold_rmse)
+                self.fold_models_.append(
+                    {
+                        "fold_index": fold_idx,
+                        "pipeline": fold_pipeline,
+                        "feature_scaler": feature_scaler,
+                        "backend": backend,
+                        "feature_columns": list(train_features.columns),
+                        "fold_rmse": fold_rmse,
+                        "backend_state": backend.get_state(),
+                    }
+                )
+                fold_bar.update(1)
 
         if np.isnan(oof_original).any():
             raise RuntimeError("OOF predictions for the tabular MLP contain unfilled rows.")

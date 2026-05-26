@@ -13,6 +13,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+from tqdm.auto import tqdm
 
 if __package__ in {None, ""}:  # pragma: no cover - direct execution shim
     ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,11 @@ class KernelMachineModel(AbstractBaseModel):
     """Support vector regression backends with fold-local feature scaling."""
 
     BACKEND_ORDER = ("svr_rbf", "svr_linear")
+    FAMILY_LABEL = "Family E"
+    BACKEND_DISPLAY_NAMES = {
+        "svr_rbf": "SVR-RBF",
+        "svr_linear": "SVR-Linear",
+    }
 
     def __init__(
         self,
@@ -97,6 +103,8 @@ class KernelMachineModel(AbstractBaseModel):
 
         splitter = GroupKFold(n_splits=min(self.n_splits, n_unique_groups))
         indices = np.arange(len(feature_frame))
+        folds = list(splitter.split(indices, groups=groups))
+        n_folds = len(folds)
 
         self.fold_models_ = {backend: [] for backend in self.BACKEND_ORDER}
         self.fold_scores_ = {backend: [] for backend in self.BACKEND_ORDER}
@@ -106,46 +114,57 @@ class KernelMachineModel(AbstractBaseModel):
         for backend_name in self.BACKEND_ORDER:
             backend_scaled_oof = np.full(len(feature_frame), np.nan, dtype=float)
             backend_original_oof = np.full(len(feature_frame), np.nan, dtype=float)
+            backend_display = self.BACKEND_DISPLAY_NAMES.get(backend_name, backend_name)
 
-            for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(indices, groups=groups)):
-                train_df = df.iloc[train_idx].copy()
-                val_df = df.iloc[val_idx].copy()
-                y_train = target[train_idx]
-                y_val = target[val_idx]
+            with tqdm(
+                total=n_folds,
+                desc=f"Training {self.FAMILY_LABEL}: {backend_display}",
+                dynamic_ncols=True,
+                leave=False,
+            ) as fold_bar:
+                for fold_idx, (train_idx, val_idx) in enumerate(folds):
+                    fold_bar.set_description(
+                        f"Training {self.FAMILY_LABEL}: {backend_display} | Fold {fold_idx + 1}/{n_folds}"
+                    )
+                    train_df = df.iloc[train_idx].copy()
+                    val_df = df.iloc[val_idx].copy()
+                    y_train = target[train_idx]
+                    y_val = target[val_idx]
 
-                fold_pipeline = deepcopy(self.feature_pipeline)
-                fold_pipeline.scale_target = self.scale_target
-                fold_pipeline.fit(train_df, y=y_train)
+                    fold_pipeline = deepcopy(self.feature_pipeline)
+                    fold_pipeline.scale_target = self.scale_target
+                    fold_pipeline.fit(train_df, y=y_train)
 
-                train_features = self._build_feature_frame(train_df, pipeline=fold_pipeline)
-                val_features = self._build_feature_frame(
-                    val_df,
-                    pipeline=fold_pipeline,
-                    reference_columns=train_features.columns,
-                )
+                    train_features = self._build_feature_frame(train_df, pipeline=fold_pipeline)
+                    val_features = self._build_feature_frame(
+                        val_df,
+                        pipeline=fold_pipeline,
+                        reference_columns=train_features.columns,
+                    )
 
-                train_target_scaled = self._scale_target(y_train, pipeline=fold_pipeline)
-                estimator = self._make_estimator(backend_name)
-                estimator.fit(train_features, train_target_scaled)
+                    train_target_scaled = self._scale_target(y_train, pipeline=fold_pipeline)
+                    estimator = self._make_estimator(backend_name)
+                    estimator.fit(train_features, train_target_scaled)
 
-                val_pred_scaled = np.asarray(estimator.predict(val_features), dtype=float).reshape(-1)
-                val_pred = fold_pipeline.inverse_transform_target(val_pred_scaled)
+                    val_pred_scaled = np.asarray(estimator.predict(val_features), dtype=float).reshape(-1)
+                    val_pred = fold_pipeline.inverse_transform_target(val_pred_scaled)
 
-                backend_scaled_oof[val_idx] = val_pred_scaled
-                backend_original_oof[val_idx] = val_pred
+                    backend_scaled_oof[val_idx] = val_pred_scaled
+                    backend_original_oof[val_idx] = val_pred
 
-                fold_rmse = float(np.sqrt(np.mean((val_pred - y_val) ** 2)))
-                self.fold_scores_[backend_name].append(fold_rmse)
-                self.fold_models_[backend_name].append(
-                    {
-                        "fold_index": fold_idx,
-                        "pipeline": fold_pipeline,
-                        "model": estimator,
-                        "feature_columns": list(train_features.columns),
-                        "fold_rmse": fold_rmse,
-                        "backend_state": self._serializable_model_state(estimator),
-                    }
-                )
+                    fold_rmse = float(np.sqrt(np.mean((val_pred - y_val) ** 2)))
+                    self.fold_scores_[backend_name].append(fold_rmse)
+                    self.fold_models_[backend_name].append(
+                        {
+                            "fold_index": fold_idx,
+                            "pipeline": fold_pipeline,
+                            "model": estimator,
+                            "feature_columns": list(train_features.columns),
+                            "fold_rmse": fold_rmse,
+                            "backend_state": self._serializable_model_state(estimator),
+                        }
+                    )
+                    fold_bar.update(1)
 
             if np.isnan(backend_original_oof).any():
                 raise RuntimeError(f"OOF predictions for '{backend_name}' contain unfilled rows.")
