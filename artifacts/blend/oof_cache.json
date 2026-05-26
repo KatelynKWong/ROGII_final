@@ -1,0 +1,20 @@
+{
+  "peer_names": [
+    "tree_lightgbm",
+    "tree_catboost",
+    "tree_xgboost",
+    "sequence_bilstm",
+    "spatial_knn_5",
+    "spatial_knn_15",
+    "spatial_knn_30",
+    "kernels_svr_rbf",
+    "kernels_svr_linear",
+    "tabular_mlp",
+    "linear_ridge",
+    "linear_lasso",
+    "linear_elasticnet",
+    "baseline_rf",
+    "baseline_et",
+    "baseline_hist"
+  ]
+}
