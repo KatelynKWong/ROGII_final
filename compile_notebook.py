@@ -78,7 +78,6 @@ MAIN_GUARDS = (
     "if __name__ == '__main__':",
 )
 
-
 def strip_main_guard(source: str) -> str:
     """Remove top-level smoke-test blocks guarded by __main__ checks."""
     lines = source.splitlines()
@@ -110,6 +109,19 @@ def strip_main_guard(source: str) -> str:
     return result
 
 
+def build_execution_cell() -> object:
+    return new_code_cell(
+        'import sys\n'
+        'sys.argv = [\n'
+        '    "blend.py",\n'
+        '    "--train-root", "/kaggle/input/competitions/rogii-wellbore-geology-prediction/train",\n'
+        '    "--test-root", "/kaggle/input/competitions/rogii-wellbore-geology-prediction/test",\n'
+        '    "--submission-path", "submission.csv"\n'
+        ']\n'
+        'main()\n'
+    )
+
+
 def build_notebook_cells(source_files: Sequence[Tuple[str, str]]) -> List[object]:
     cells: List[object] = []
     for relative_path, section_title in source_files:
@@ -123,13 +135,7 @@ def build_notebook_cells(source_files: Sequence[Tuple[str, str]]) -> List[object
 
         cells.append(new_code_cell(cleaned_source))
 
-    cells.append(
-        new_code_cell(
-            'import sys\n'
-            'sys.argv = ["blend.py", "--full"]\n'
-            'main()\n'
-        )
-    )
+    cells.append(build_execution_cell())
     return cells
 
 

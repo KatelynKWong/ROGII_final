@@ -11,8 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
@@ -37,7 +36,16 @@ def _select_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
-from src.pipeline import AbstractBaseModel, FeaturePipeline
+try:  # pragma: no cover - notebook flattening shim
+    from src.pipeline import AbstractBaseModel, FeaturePipeline, make_stratified_group_folds
+except ModuleNotFoundError:  # pragma: no cover - flattened notebook execution shim
+    required = {"AbstractBaseModel", "FeaturePipeline", "make_stratified_group_folds"}
+    if required.issubset(globals()):
+        AbstractBaseModel = globals()["AbstractBaseModel"]
+        FeaturePipeline = globals()["FeaturePipeline"]
+        make_stratified_group_folds = globals()["make_stratified_group_folds"]
+    else:
+        raise
 
 
 class _TabularMLPNet(nn.Module):
@@ -87,13 +95,19 @@ class _TorchTabularRegressor:
         tensor_x = torch.tensor(X, dtype=torch.float32)
         tensor_y = torch.tensor(y, dtype=torch.float32)
         dataset = TensorDataset(tensor_x, tensor_y)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=self.device.type == "cuda",
+        )
 
         self.net.train()
         for _ in range(self.epochs):
             for batch_x, batch_y in loader:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
+                batch_x = batch_x.to(self.device, non_blocking=self.device.type == "cuda")
+                batch_y = batch_y.to(self.device, non_blocking=self.device.type == "cuda")
                 self.optimizer.zero_grad(set_to_none=True)
                 preds = self.net(batch_x)
                 loss = self.criterion(preds, batch_y)
@@ -120,6 +134,7 @@ class DeepTabularModel(AbstractBaseModel):
 
     FAMILY_LABEL = "Family F"
     BACKEND_DISPLAY_NAME = "Tabular MLP"
+    MAX_TAB_TRAIN_ROWS = 100000
 
     def __init__(
         self,
@@ -131,7 +146,7 @@ class DeepTabularModel(AbstractBaseModel):
         hidden_dims: Sequence[int] = (128, 64),
         dropout: float = 0.15,
         epochs: int = 15,
-        batch_size: int = 32,
+        batch_size: int = 2048,
         learning_rate: float = 1e-3,
         scale_target: bool = True,
         random_state: int = 42,
@@ -167,6 +182,49 @@ class DeepTabularModel(AbstractBaseModel):
         self.oof_predictions_: Optional[np.ndarray] = None
         self.is_fitted_: bool = False
 
+    def _scale_residual(self, residual: np.ndarray, mean: float, std: float) -> np.ndarray:
+        residual_arr = np.asarray(residual, dtype=float).reshape(-1)
+        if not self.scale_target:
+            return residual_arr
+        return (residual_arr - float(mean)) / (float(std) or 1.0)
+
+    def _unscale_residual(self, residual_scaled: np.ndarray, mean: float, std: float) -> np.ndarray:
+        residual_arr = np.asarray(residual_scaled, dtype=float).reshape(-1)
+        if not self.scale_target:
+            return residual_arr
+        return residual_arr * (float(std) or 1.0) + float(mean)
+
+    def _inverse_residual_transform(
+        self,
+        pipeline: FeaturePipeline,
+        residual_scaled: np.ndarray,
+        mean: float,
+        std: float,
+    ) -> np.ndarray:
+        residual_pipeline = deepcopy(pipeline)
+        residual_pipeline.target_mean_ = float(mean)
+        residual_pipeline.target_std_ = float(std) or 1.0
+        residual_pipeline.scale_target = True
+        return residual_pipeline.inverse_transform_target(residual_scaled)
+
+    def _training_clip_bounds(self, target: Sequence[float], padding: float = 250.0) -> tuple[float, float]:
+        target_arr = np.asarray(target, dtype=float).reshape(-1)
+        finite = target_arr[np.isfinite(target_arr)]
+        if finite.size == 0:
+            raise ValueError("Cannot derive training clip bounds from an empty target array.")
+        safe_min = float(np.min(finite) - float(padding))
+        safe_max = float(np.max(finite) + float(padding))
+        return (safe_min, safe_max) if safe_min <= safe_max else (safe_max, safe_min)
+
+    def _prediction_clip_bounds(self, prior: Sequence[float], padding: float = 150.0) -> tuple[float, float]:
+        prior_arr = np.asarray(prior, dtype=float).reshape(-1)
+        finite = prior_arr[np.isfinite(prior_arr)]
+        if finite.size == 0:
+            raise ValueError("Cannot derive prediction clip bounds from an empty prior array.")
+        safe_min = float(np.min(finite) - float(padding))
+        safe_max = float(np.max(finite) + float(padding))
+        return (safe_min, safe_max) if safe_min <= safe_max else (safe_max, safe_min)
+
     def fit(self, X: Any, y: Any) -> "DeepTabularModel":
         df = self._ensure_dataframe(X)
         target = self._resolve_target(df, y)
@@ -177,9 +235,13 @@ class DeepTabularModel(AbstractBaseModel):
         if n_unique_groups < 2:
             raise ValueError("Need at least two unique wells for GroupKFold.")
 
-        splitter = GroupKFold(n_splits=min(self.n_splits, n_unique_groups))
-        indices = np.arange(len(df))
-        folds = list(splitter.split(indices, groups=groups))
+        folds = make_stratified_group_folds(
+            df,
+            target_col=self.target_col,
+            group_col=self.group_col,
+            n_splits=self.n_splits,
+            random_state=self.random_state,
+        )
         n_folds = len(folds)
 
         oof_scaled = np.full(len(df), np.nan, dtype=float)
@@ -202,6 +264,13 @@ class DeepTabularModel(AbstractBaseModel):
                 val_df = df.iloc[val_idx].copy()
                 y_train = target[train_idx]
                 y_val = target[val_idx]
+                train_safe_min, train_safe_max = self._training_clip_bounds(y_train)
+
+                if len(train_df) > self.MAX_TAB_TRAIN_ROWS:
+                    rng = np.random.default_rng(self.random_state + fold_idx)
+                    sampled_idx = np.sort(rng.choice(len(train_df), size=self.MAX_TAB_TRAIN_ROWS, replace=False))
+                    train_df = train_df.iloc[sampled_idx].copy()
+                    y_train = y_train[sampled_idx]
 
                 fold_pipeline = deepcopy(self.feature_pipeline)
                 fold_pipeline.scale_target = self.scale_target
@@ -214,21 +283,32 @@ class DeepTabularModel(AbstractBaseModel):
                     reference_columns=train_features.columns,
                 )
 
-                feature_scaler = StandardScaler()
+                feature_scaler = RobustScaler()
                 train_features_scaled = feature_scaler.fit_transform(train_features)
                 val_features_scaled = feature_scaler.transform(val_features)
 
-                y_train_scaled = self._scale_target(y_train, pipeline=fold_pipeline)
+                train_prior = fold_pipeline.predict_structural_prior(train_df)
+                val_prior = fold_pipeline.predict_structural_prior(val_df)
+                train_residual = y_train - train_prior
+                residual_mean = float(np.mean(train_residual))
+                residual_std = float(np.std(train_residual, ddof=0) or 1.0)
+                y_train_scaled = self._scale_residual(train_residual, residual_mean, residual_std)
                 backend = self._make_backend(
                     input_dim=train_features_scaled.shape[1],
                     seed=self.random_state + fold_idx,
                 )
                 backend.fit(train_features_scaled, y_train_scaled)
 
-                val_pred_scaled = backend.predict(val_features_scaled)
-                val_pred = fold_pipeline.inverse_transform_target(val_pred_scaled)
+                val_pred_residual_scaled = backend.predict(val_features_scaled)
+                val_pred_residual = self._inverse_residual_transform(
+                    fold_pipeline,
+                    val_pred_residual_scaled,
+                    residual_mean,
+                    residual_std,
+                )
+                val_pred = np.clip(val_prior + val_pred_residual, train_safe_min, train_safe_max)
 
-                oof_scaled[val_idx] = val_pred_scaled
+                oof_scaled[val_idx] = self.feature_pipeline.transform_target(val_pred)
                 oof_original[val_idx] = val_pred
 
                 fold_rmse = float(np.sqrt(np.mean((val_pred - y_val) ** 2)))
@@ -240,11 +320,25 @@ class DeepTabularModel(AbstractBaseModel):
                         "feature_scaler": feature_scaler,
                         "backend": backend,
                         "feature_columns": list(train_features.columns),
+                        "residual_mean": residual_mean,
+                        "residual_std": residual_std,
                         "fold_rmse": fold_rmse,
                         "backend_state": backend.get_state(),
                     }
                 )
                 fold_bar.update(1)
+
+                del backend
+                del feature_scaler
+                del train_features_scaled
+                del val_features_scaled
+                del train_features
+                del val_features
+                del fold_pipeline
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         if np.isnan(oof_original).any():
             raise RuntimeError("OOF predictions for the tabular MLP contain unfilled rows.")
@@ -257,9 +351,14 @@ class DeepTabularModel(AbstractBaseModel):
         full_pipeline.scale_target = self.scale_target
         full_pipeline.fit(df, y=target)
         full_features = self._build_numeric_features(full_pipeline, df)
-        full_scaler = StandardScaler()
+        full_scaler = RobustScaler()
         full_features_scaled = full_scaler.fit_transform(full_features)
-        full_target_scaled = self._scale_target(target, pipeline=full_pipeline)
+        full_prior = full_pipeline.predict_structural_prior(df)
+        full_residual = target - full_prior
+        full_residual_mean = float(np.mean(full_residual))
+        full_residual_std = float(np.std(full_residual, ddof=0) or 1.0)
+        full_target_scaled = self._scale_residual(full_residual, full_residual_mean, full_residual_std)
+        full_safe_min, full_safe_max = self._training_clip_bounds(full_target)
 
         full_backend = self._make_backend(
             input_dim=full_features_scaled.shape[1],
@@ -273,6 +372,9 @@ class DeepTabularModel(AbstractBaseModel):
             "feature_scaler": full_scaler,
             "backend": full_backend,
             "feature_columns": list(full_features.columns),
+            "residual_mean": full_residual_mean,
+            "residual_std": full_residual_std,
+            "clip_bounds": (full_safe_min, full_safe_max),
             "backend_state": full_backend.get_state(),
         }
 
@@ -285,14 +387,22 @@ class DeepTabularModel(AbstractBaseModel):
             raise RuntimeError("DeepTabularModel must be fit before calling predict.")
         df = self._ensure_dataframe(X)
         model_bundle = self.full_model_
+        prior = model_bundle["pipeline"].predict_structural_prior(df)
         feature_frame = self._build_numeric_features(
             model_bundle["pipeline"],
             df,
             reference_columns=model_bundle["feature_columns"],
         )
         feature_frame_scaled = model_bundle["feature_scaler"].transform(feature_frame)
-        pred_scaled = model_bundle["backend"].predict(feature_frame_scaled)
-        return self._unscale_target(pred_scaled, pipeline=model_bundle["pipeline"])
+        pred_residual_scaled = model_bundle["backend"].predict(feature_frame_scaled)
+        pred_residual = self._inverse_residual_transform(
+            model_bundle["pipeline"],
+            pred_residual_scaled,
+            model_bundle["residual_mean"],
+            model_bundle["residual_std"],
+        )
+        safe_min, safe_max = self._prediction_clip_bounds(prior)
+        return np.clip(prior + pred_residual, safe_min, safe_max)
 
     def predict_oof(self) -> np.ndarray:
         if self.oof_predictions_tabular_mlp is None:

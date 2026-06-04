@@ -11,12 +11,166 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
 
+try:  # pragma: no cover - optional newer sklearn API
+    from sklearn.model_selection import StratifiedGroupKFold  # type: ignore
+except Exception:  # pragma: no cover - fallback for older sklearn versions
+    StratifiedGroupKFold = None  # type: ignore[assignment]
+
 import os
 import sys
 
 
 
 FAST_DEBUG = False
+
+
+def log_family_training_start(family_label: str, family_key: str) -> None:
+    print("\n" + "=" * 50)
+    print(f"🚀 [START] Training Sequence Initiated for: {family_label} ({family_key})")
+    print("=" * 50)
+
+
+def log_family_training_complete(family_label: str) -> None:
+    print(f"✅ [COMPLETE] Successfully Trained {family_label}! Moving to next stage.")
+    print("=" * 50 + "\n")
+
+
+def _safe_normalized_corr(left: Sequence[float], right: Sequence[float]) -> float:
+    left_arr = np.asarray(left, dtype=float).reshape(-1)
+    right_arr = np.asarray(right, dtype=float).reshape(-1)
+    length = min(len(left_arr), len(right_arr))
+    if length < 2:
+        return 0.0
+
+    left_arr = left_arr[-length:]
+    right_arr = right_arr[-length:]
+    if not np.isfinite(left_arr).any() or not np.isfinite(right_arr).any():
+        return 0.0
+
+    left_std = float(np.nanstd(left_arr))
+    right_std = float(np.nanstd(right_arr))
+    if left_std == 0.0 or right_std == 0.0:
+        return 0.0
+
+    left_centered = left_arr - np.nanmean(left_arr)
+    right_centered = right_arr - np.nanmean(right_arr)
+    denom = float(np.sqrt(np.sum(left_centered ** 2) * np.sum(right_centered ** 2)))
+    if denom == 0.0 or not np.isfinite(denom):
+        return 0.0
+    return float(np.sum(left_centered * right_centered) / denom)
+
+
+def _bin_series_to_labels(values: Sequence[float], n_bins: int) -> np.ndarray:
+    series = pd.Series(np.asarray(values, dtype=float))
+    labels = np.zeros(len(series), dtype=int)
+    valid = series[np.isfinite(series)]
+    if valid.empty:
+        return labels
+
+    n_bins = max(1, min(int(n_bins), int(valid.nunique()) or 1))
+    if n_bins == 1:
+        return labels
+
+    try:
+        binned = pd.qcut(valid.rank(method="first"), q=n_bins, labels=False, duplicates="drop")
+    except Exception:
+        try:
+            binned = pd.cut(valid, bins=n_bins, labels=False, duplicates="drop")
+        except Exception:
+            return labels
+
+    labels[valid.index.to_numpy()] = np.asarray(binned, dtype=int)
+    return labels
+
+
+def _well_signed_direction(group: pd.DataFrame, md_col: str = "MD", z_col: str = "Z") -> int:
+    if z_col not in group.columns:
+        return 0
+
+    z = pd.to_numeric(group[z_col], errors="coerce").to_numpy(dtype=float)
+    if len(z) < 2 or not np.isfinite(z).any():
+        return 0
+
+    if md_col in group.columns:
+        md = pd.to_numeric(group[md_col], errors="coerce").to_numpy(dtype=float)
+        dmd = np.diff(md)
+        dz = np.diff(z)
+        valid = np.isfinite(dmd) & np.isfinite(dz) & (np.abs(dmd) > 1e-12)
+        if valid.any():
+            ratios = dz[valid] / dmd[valid]
+            finite = ratios[np.isfinite(ratios)]
+            if finite.size:
+                return int(np.sign(np.nanmedian(finite)))
+
+    dz = np.diff(z)
+    finite = dz[np.isfinite(dz)]
+    if finite.size:
+        return int(np.sign(np.nanmedian(finite)))
+    return 0
+
+
+def _well_target_bin(values: Sequence[float], n_bins: int) -> np.ndarray:
+    return _bin_series_to_labels(values, n_bins=n_bins)
+
+
+def make_stratified_group_folds(
+    df: pd.DataFrame,
+    target_col: str = "TVT",
+    group_col: str = "WELLNAME",
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    if group_col not in df.columns:
+        raise ValueError(f"Missing required group column '{group_col}'.")
+    if target_col not in df.columns:
+        raise ValueError(f"Missing target column '{target_col}'.")
+
+    working = df.reset_index(drop=True).copy()
+    groups = working[group_col].astype(str).to_numpy()
+    n_unique_groups = len(pd.Index(groups).unique())
+    if n_unique_groups < 2:
+        raise ValueError("Need at least two unique wells for grouped validation.")
+
+    n_splits = min(int(n_splits), n_unique_groups)
+    if n_splits < 2:
+        raise ValueError("Need at least two folds for grouped validation.")
+
+    well_rows: List[Dict[str, Any]] = []
+    for wellname, group in working.groupby(group_col, sort=False):
+        target_values = pd.to_numeric(group[target_col], errors="coerce").dropna()
+        median_target = float(target_values.median()) if not target_values.empty else np.nan
+        well_rows.append(
+            {
+                group_col: wellname,
+                "median_target": median_target,
+                "signed_direction": _well_signed_direction(group),
+            }
+        )
+
+    well_meta = pd.DataFrame(well_rows)
+    well_meta["target_bin"] = _well_target_bin(well_meta["median_target"].to_numpy(dtype=float), n_bins=n_splits)
+    direction_map = {-1: 0, 0: 1, 1: 2}
+    well_meta["direction_bin"] = well_meta["signed_direction"].map(direction_map).fillna(1).astype(int)
+    well_meta["stratify_label"] = well_meta["target_bin"].astype(int) * 3 + well_meta["direction_bin"].astype(int)
+
+    label_map = well_meta.set_index(group_col)["stratify_label"].to_dict()
+    labels = np.asarray([label_map[str(name)] for name in groups], dtype=int)
+
+    if StratifiedGroupKFold is not None:
+        try:
+            splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            return [
+                (np.asarray(train_idx, dtype=int), np.asarray(val_idx, dtype=int))
+                for train_idx, val_idx in splitter.split(working, labels, groups=groups)
+            ]
+        except Exception:
+            pass
+
+    splitter = GroupKFold(n_splits=n_splits)
+    return [
+        (np.asarray(train_idx, dtype=int), np.asarray(val_idx, dtype=int))
+        for train_idx, val_idx in splitter.split(np.arange(len(working)), groups=groups)
+    ]
 
 
 class AbstractBaseModel(ABC):
@@ -67,13 +221,26 @@ class FeaturePipeline:
         self.target_std_: float = 1.0
         self.numeric_fill_values_: Dict[str, float] = {}
         self.feature_columns_: List[str] = []
+        self.structural_prior_feature_columns_: List[str] = []
+        self.structural_prior_feature_means_: Optional[np.ndarray] = None
+        self.structural_prior_feature_scales_: Optional[np.ndarray] = None
+        self.structural_prior_coef_: Optional[np.ndarray] = None
+        self.structural_prior_intercept_: float = 0.0
 
     @staticmethod
     def parse_wellname_from_filename(filename: str | Path) -> str:
         """Extract WELLNAME from the competition filename conventions."""
 
         name = Path(filename).name
-        suffixes = ("__horizontal_well.csv", "__typewell.csv", ".csv", ".png")
+        suffixes = (
+            "__horizontal_well.csv",
+            "__horizontal_well.parquet",
+            "__typewell.csv",
+            "__typewell.parquet",
+            ".csv",
+            ".parquet",
+            ".png",
+        )
         for suffix in suffixes:
             if name.endswith(suffix):
                 return name[: -len(suffix)]
@@ -84,13 +251,29 @@ class FeaturePipeline:
 
         root = Path(root_dir)
         well_frames: Dict[str, Dict[str, pd.DataFrame]] = {}
-        for horizontal_path in sorted(root.glob("*__horizontal_well.csv")):
+        for horizontal_path in sorted(root.rglob("*__horizontal_well.*")):
+            if horizontal_path.suffix.lower() not in {".csv", ".parquet"}:
+                continue
             wellname = self.parse_wellname_from_filename(horizontal_path)
-            typewell_path = root / f"{wellname}__typewell.csv"
+            typewell_candidates = list(root.rglob(f"{wellname}__typewell.*"))
+            typewell_path = next((path for path in typewell_candidates if path.suffix.lower() in {".csv", ".parquet"}), None)
+
+            if horizontal_path.suffix.lower() == ".parquet":
+                horizontal_df = pd.read_parquet(horizontal_path)
+            else:
+                horizontal_df = pd.read_csv(horizontal_path)
+
+            if typewell_path is not None:
+                if typewell_path.suffix.lower() == ".parquet":
+                    typewell_df = pd.read_parquet(typewell_path)
+                else:
+                    typewell_df = pd.read_csv(typewell_path)
+            else:
+                typewell_df = pd.DataFrame()
 
             well_frames[wellname] = {
-                "horizontal": pd.read_csv(horizontal_path),
-                "typewell": pd.read_csv(typewell_path) if typewell_path.exists() else pd.DataFrame(),
+                "horizontal": horizontal_df,
+                "typewell": typewell_df,
             }
 
             well_frames[wellname]["horizontal"][self.group_col] = wellname
@@ -122,6 +305,7 @@ class FeaturePipeline:
             col: float(transformed[col].median()) if transformed[col].notna().any() else 0.0
             for col in self.feature_columns_
         }
+        self.fit_structural_prior(df, y=y)
         return self
 
     def fit_transform(self, df: pd.DataFrame, y: Optional[Sequence[float]] = None) -> pd.DataFrame:
@@ -139,6 +323,124 @@ class FeaturePipeline:
         if not self.scale_target:
             return y_arr
         return y_arr * (self.target_std_ or 1.0) + self.target_mean_
+
+    def _structural_prior_feature_columns(self, transformed: pd.DataFrame) -> List[str]:
+        candidate_prefixes = (
+            "surface_delta_",
+            "surface_abs_delta_",
+            "tortuosity_roll_std_",
+            "direction_vector_std_",
+            "gr_typewell_",
+            "gr_typewell_forward_corr_",
+            "gr_typewell_reverse_corr_",
+            "gr_typewell_corr_gap_",
+        )
+        direct_candidates = [
+            self.z_col,
+            "delta_z",
+            "delta_md",
+            "dz_per_md",
+            "signed_dz_per_md",
+            "sin_azimuth",
+            "cos_azimuth",
+            "sin_azimuth_dz_per_md",
+            "cos_azimuth_dz_per_md",
+        ]
+        columns: List[str] = [col for col in direct_candidates if col in transformed.columns]
+        columns.extend(
+            col
+            for col in transformed.columns
+            if any(col.startswith(prefix) for prefix in candidate_prefixes)
+        )
+        return list(dict.fromkeys(columns))
+
+    def fit_structural_prior(self, df: pd.DataFrame, y: Optional[Sequence[float]] = None) -> "FeaturePipeline":
+        transformed = self.transform(df, fit_mode=True)
+        if y is not None:
+            target = np.asarray(y, dtype=float).reshape(-1)
+        elif self.target_col in df.columns:
+            target = pd.to_numeric(df[self.target_col], errors="coerce").to_numpy(dtype=float)
+        else:
+            self.structural_prior_feature_columns_ = []
+            self.structural_prior_feature_means_ = None
+            self.structural_prior_feature_scales_ = None
+            self.structural_prior_coef_ = None
+            self.structural_prior_intercept_ = float(self.target_mean_)
+            return self
+
+        if len(target) != len(transformed):
+            raise ValueError("Target length must match the transformed feature matrix length.")
+
+        valid_mask = np.isfinite(target)
+        if not valid_mask.any():
+            self.structural_prior_feature_columns_ = []
+            self.structural_prior_feature_means_ = None
+            self.structural_prior_feature_scales_ = None
+            self.structural_prior_coef_ = None
+            self.structural_prior_intercept_ = float(self.target_mean_)
+            return self
+
+        feature_columns = self._structural_prior_feature_columns(transformed)
+        if not feature_columns:
+            self.structural_prior_feature_columns_ = []
+            self.structural_prior_feature_means_ = None
+            self.structural_prior_feature_scales_ = None
+            self.structural_prior_coef_ = None
+            self.structural_prior_intercept_ = float(np.nanmean(target[valid_mask]))
+            return self
+
+        feature_frame = transformed.loc[valid_mask, feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        X = feature_frame.to_numpy(dtype=float)
+        y_arr = np.asarray(target[valid_mask], dtype=float)
+
+        feature_means = X.mean(axis=0)
+        feature_scales = X.std(axis=0, ddof=0)
+        feature_scales[feature_scales == 0.0] = 1.0
+        X_scaled = (X - feature_means) / feature_scales
+        X_design = np.column_stack([np.ones(len(X_scaled), dtype=float), X_scaled])
+        ridge = 1e-3 * np.eye(X_design.shape[1], dtype=float)
+        ridge[0, 0] = 0.0
+        try:
+            beta = np.linalg.solve(X_design.T @ X_design + ridge, X_design.T @ y_arr)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.pinv(X_design.T @ X_design + ridge) @ (X_design.T @ y_arr)
+
+        self.structural_prior_feature_columns_ = list(feature_columns)
+        self.structural_prior_feature_means_ = feature_means.astype(float)
+        self.structural_prior_feature_scales_ = feature_scales.astype(float)
+        self.structural_prior_intercept_ = float(beta[0])
+        self.structural_prior_coef_ = beta[1:].astype(float)
+        return self
+
+    def predict_structural_prior(self, df: pd.DataFrame) -> np.ndarray:
+        if self.structural_prior_coef_ is None or not self.structural_prior_feature_columns_:
+            if self.z_col in df.columns:
+                z = pd.to_numeric(df[self.z_col], errors="coerce").fillna(self.target_mean_).to_numpy(dtype=float)
+                return z.astype(float)
+            return np.full(len(df), self.target_mean_, dtype=float)
+
+        transformed = self.transform(df)
+        feature_frame = transformed.reindex(columns=self.structural_prior_feature_columns_, fill_value=0.0)
+        X = feature_frame.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        means = np.asarray(self.structural_prior_feature_means_, dtype=float)
+        scales = np.asarray(self.structural_prior_feature_scales_, dtype=float)
+        scales = np.where(scales == 0.0, 1.0, scales)
+        X_scaled = (X - means) / scales
+        return self.structural_prior_intercept_ + X_scaled @ np.asarray(self.structural_prior_coef_, dtype=float)
+
+    def transform_residual_target(self, df: pd.DataFrame, y: Sequence[float]) -> np.ndarray:
+        target = np.asarray(y, dtype=float).reshape(-1)
+        prior = self.predict_structural_prior(df)
+        if len(prior) != len(target):
+            raise ValueError("Residual target length must match the dataframe length.")
+        return target - prior
+
+    def inverse_transform_residual_target(self, df: pd.DataFrame, residual: Sequence[float]) -> np.ndarray:
+        residual_arr = np.asarray(residual, dtype=float).reshape(-1)
+        prior = self.predict_structural_prior(df)
+        if len(prior) != len(residual_arr):
+            raise ValueError("Residual prediction length must match the dataframe length.")
+        return prior + residual_arr
 
     def transform(self, df: pd.DataFrame, fit_mode: bool = False) -> pd.DataFrame:
         """Engineer leakage-safe per-well features."""
@@ -231,35 +533,62 @@ class FeaturePipeline:
         dmd = md.diff().fillna(0.0)
         step_length = np.sqrt(dx.pow(2) + dy.pow(2) + dz.pow(2))
         step_length = step_length.replace(0.0, np.nan)
+        dz_per_md = dz / dmd.replace(0.0, np.nan)
+        signed_dz_per_md = dz_per_md.replace([np.inf, -np.inf], np.nan)
 
         vertical_ratio = np.abs(dz) / step_length
         vertical_ratio = vertical_ratio.clip(lower=0.0, upper=1.0).fillna(1.0)
         inclination_rad = np.arccos(vertical_ratio)
         inclination_deg = np.degrees(inclination_rad)
+        sin_azimuth = np.sin(np.arctan2(dy.to_numpy(), dx.to_numpy() + 1e-12))
+        cos_azimuth = np.cos(np.arctan2(dy.to_numpy(), dx.to_numpy() + 1e-12))
+        unit_dx = (dx / step_length).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        unit_dy = (dy / step_length).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        unit_dz = (dz / step_length).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
         group["delta_x"] = dx.to_numpy()
         group["delta_y"] = dy.to_numpy()
         group["delta_z"] = dz.to_numpy()
         group["delta_md"] = dmd.to_numpy()
+        group["dz_per_md"] = dz_per_md.fillna(0.0).to_numpy()
+        group["signed_dz_per_md"] = signed_dz_per_md.fillna(0.0).to_numpy()
         group["step_length"] = np.nan_to_num(step_length.to_numpy(), nan=0.0)
         group["horizontal_step"] = np.sqrt(dx.pow(2) + dy.pow(2)).to_numpy()
         group["wellbore_inclination_rad"] = inclination_rad.to_numpy()
         group["wellbore_inclination_deg"] = inclination_deg.to_numpy()
         group["azimuth_rad"] = np.arctan2(dy.to_numpy(), dx.to_numpy() + 1e-12)
         group["azimuth_deg"] = np.degrees(group["azimuth_rad"])
+        group["sin_azimuth"] = sin_azimuth
+        group["cos_azimuth"] = cos_azimuth
+        group["sin_azimuth_dz_per_md"] = sin_azimuth * signed_dz_per_md.fillna(0.0).to_numpy()
+        group["cos_azimuth_dz_per_md"] = cos_azimuth * signed_dz_per_md.fillna(0.0).to_numpy()
         group["curvature_proxy"] = np.sqrt(dx.diff().fillna(0.0).pow(2) + dy.diff().fillna(0.0).pow(2) + dz.diff().fillna(0.0).pow(2))
+
+        for window in self.gr_windows:
+            roll_std_dx = pd.Series(unit_dx).rolling(window=int(window), min_periods=1).std(ddof=0).fillna(0.0)
+            roll_std_dy = pd.Series(unit_dy).rolling(window=int(window), min_periods=1).std(ddof=0).fillna(0.0)
+            roll_std_dz = pd.Series(unit_dz).rolling(window=int(window), min_periods=1).std(ddof=0).fillna(0.0)
+            group[f"tortuosity_roll_std_{window}"] = np.sqrt(
+                roll_std_dx.to_numpy() ** 2 + roll_std_dy.to_numpy() ** 2 + roll_std_dz.to_numpy() ** 2
+            )
 
         return group.fillna({
             "delta_x": 0.0,
             "delta_y": 0.0,
             "delta_z": 0.0,
             "delta_md": 0.0,
+            "dz_per_md": 0.0,
+            "signed_dz_per_md": 0.0,
             "step_length": 0.0,
             "horizontal_step": 0.0,
             "wellbore_inclination_rad": 0.0,
             "wellbore_inclination_deg": 0.0,
             "azimuth_rad": 0.0,
             "azimuth_deg": 0.0,
+            "sin_azimuth": 0.0,
+            "cos_azimuth": 0.0,
+            "sin_azimuth_dz_per_md": 0.0,
+            "cos_azimuth_dz_per_md": 0.0,
             "curvature_proxy": 0.0,
         })
 
@@ -373,20 +702,20 @@ class ExperimentOrchestrator:
         mask = df[group_col].astype(str).isin(chosen_wells)
         return df.loc[mask].copy().reset_index(drop=True)
 
-    def make_folds(self, df: pd.DataFrame, group_col: str = "WELLNAME") -> List[Tuple[np.ndarray, np.ndarray]]:
-        if group_col not in df.columns:
-            raise ValueError(f"Missing required group column '{group_col}'.")
-
+    def make_folds(
+        self,
+        df: pd.DataFrame,
+        group_col: str = "WELLNAME",
+        target_col: str = "TVT",
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
         working = self._select_working_frame(df, group_col=group_col).reset_index(drop=True)
-        groups = working[group_col].astype(str).to_numpy()
-        n_unique_groups = len(pd.Index(groups).unique())
-        if n_unique_groups < 2:
-            raise ValueError("Need at least two unique wells for GroupKFold.")
-
-        n_splits = min(self.n_splits, n_unique_groups)
-        splitter = GroupKFold(n_splits=n_splits)
-        indices = np.arange(len(working))
-        return [(train_idx, val_idx) for train_idx, val_idx in splitter.split(indices, groups=groups)]
+        return make_stratified_group_folds(
+            working,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=self.n_splits,
+            random_state=self.random_state,
+        )
 
     def cross_validate(
         self,
@@ -407,7 +736,13 @@ class ExperimentOrchestrator:
         y = pd.to_numeric(processed[target_col], errors="coerce").to_numpy(dtype=float)
         groups = processed[group_col].astype(str).to_numpy()
 
-        folds = self.make_folds(working, group_col=group_col)
+        folds = make_stratified_group_folds(
+            working,
+            target_col=target_col,
+            group_col=group_col,
+            n_splits=self.n_splits,
+            random_state=self.random_state,
+        )
         fold_summary: Dict[str, List[float]] = {}
 
         self.oof_predictions_ = {}

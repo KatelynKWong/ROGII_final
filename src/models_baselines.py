@@ -22,7 +22,14 @@ except NameError:  # pragma: no cover - notebook execution shim
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.pipeline import AbstractBaseModel, FeaturePipeline
+try:  # pragma: no cover - notebook flattening shim
+    from src.pipeline import AbstractBaseModel, FeaturePipeline
+except ModuleNotFoundError:  # pragma: no cover - flattened notebook execution shim
+    if "AbstractBaseModel" in globals() and "FeaturePipeline" in globals():
+        AbstractBaseModel = globals()["AbstractBaseModel"]
+        FeaturePipeline = globals()["FeaturePipeline"]
+    else:
+        raise
 
 
 def _resolve_path(path: str | Path) -> Path:

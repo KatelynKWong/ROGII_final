@@ -21,7 +21,14 @@ except NameError:  # pragma: no cover - notebook execution shim
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.pipeline import AbstractBaseModel, FeaturePipeline
+try:  # pragma: no cover - notebook flattening shim
+    from src.pipeline import AbstractBaseModel, FeaturePipeline
+except ModuleNotFoundError:  # pragma: no cover - flattened notebook execution shim
+    if "AbstractBaseModel" in globals() and "FeaturePipeline" in globals():
+        AbstractBaseModel = globals()["AbstractBaseModel"]
+        FeaturePipeline = globals()["FeaturePipeline"]
+    else:
+        raise
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -313,9 +320,11 @@ class TreeEnsembleModel(AbstractBaseModel):
             params={
                 "n_estimators": 180,
                 "learning_rate": 0.05,
-                "max_depth": 6,
+                "max_depth": 4,
                 "num_leaves": 31,
                 "max_bin": 255,
+                "reg_alpha": 5.0,
+                "reg_lambda": 10.0,
                 "n_jobs": -1,
                 "random_state": self.random_state,
             },
@@ -340,10 +349,12 @@ class TreeEnsembleModel(AbstractBaseModel):
             params={
                 "n_estimators": 220,
                 "learning_rate": 0.05,
-                "max_depth": 6,
+                "max_depth": 4,
                 "subsample": 0.9,
                 "colsample_bytree": 0.9,
                 "max_bin": 255,
+                "reg_alpha": 5.0,
+                "reg_lambda": 10.0,
                 "tree_method": "hist",
                 "n_jobs": -1,
                 "random_state": self.random_state,
@@ -366,7 +377,7 @@ class TreeEnsembleModel(AbstractBaseModel):
         if backend_name == "lightgbm":
             return HistGradientBoostingRegressor(
                 learning_rate=params["learning_rate"],
-                max_depth=6,
+                max_depth=4,
                 max_bins=255,
                 max_leaf_nodes=31,
                 min_samples_leaf=20,
@@ -376,13 +387,13 @@ class TreeEnsembleModel(AbstractBaseModel):
             return GradientBoostingRegressor(
                 n_estimators=params["iterations"],
                 learning_rate=params["learning_rate"],
-                max_depth=6,
+                max_depth=5,
                 random_state=self.random_state,
             )
         return GradientBoostingRegressor(
             n_estimators=params["n_estimators"],
             learning_rate=params["learning_rate"],
-            max_depth=6,
+            max_depth=4,
             random_state=self.random_state,
             subsample=0.9,
         )

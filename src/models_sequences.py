@@ -12,7 +12,14 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
 
-from src.pipeline import AbstractBaseModel, FeaturePipeline
+try:  # pragma: no cover - notebook flattening shim
+    from src.pipeline import AbstractBaseModel, FeaturePipeline
+except ModuleNotFoundError:  # pragma: no cover - flattened notebook execution shim
+    if "AbstractBaseModel" in globals() and "FeaturePipeline" in globals():
+        AbstractBaseModel = globals()["AbstractBaseModel"]
+        FeaturePipeline = globals()["FeaturePipeline"]
+    else:
+        raise
 
 import torch  # type: ignore
 import torch.nn as nn  # type: ignore

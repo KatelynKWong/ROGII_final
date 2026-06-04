@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -23,14 +23,41 @@ except NameError:  # pragma: no cover - notebook execution shim
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.pipeline import FeaturePipeline
-from src.models_baselines import BaselineEnsembleModel
-from src.models_kernels import KernelMachineModel
-from src.models_linear import LinearEnsembleModel
-from src.models_sequences import DeepSequenceModel
-from src.models_spatial import SpatialNeighborModel
-from src.models_tabnet import DeepTabularModel
-from src.models_trees import TreeEnsembleModel
+try:  # pragma: no cover - notebook flattening shim
+    from src.pipeline import FeaturePipeline, log_family_training_complete, log_family_training_start
+    from src.models_baselines import BaselineEnsembleModel
+    from src.models_kernels import KernelMachineModel
+    from src.models_linear import LinearEnsembleModel
+    from src.models_sequences import DeepSequenceModel
+    from src.models_spatial import SpatialNeighborModel
+    from src.models_tabnet import DeepTabularModel
+    from src.models_trees import TreeEnsembleModel
+except ModuleNotFoundError:  # pragma: no cover - flattened notebook execution shim
+    required_names = {
+        "FeaturePipeline",
+        "log_family_training_start",
+        "log_family_training_complete",
+        "BaselineEnsembleModel",
+        "KernelMachineModel",
+        "LinearEnsembleModel",
+        "DeepSequenceModel",
+        "SpatialNeighborModel",
+        "DeepTabularModel",
+        "TreeEnsembleModel",
+    }
+    missing = sorted(name for name in required_names if name not in globals())
+    if missing:
+        raise
+    FeaturePipeline = globals()["FeaturePipeline"]
+    log_family_training_start = globals()["log_family_training_start"]
+    log_family_training_complete = globals()["log_family_training_complete"]
+    BaselineEnsembleModel = globals()["BaselineEnsembleModel"]
+    KernelMachineModel = globals()["KernelMachineModel"]
+    LinearEnsembleModel = globals()["LinearEnsembleModel"]
+    DeepSequenceModel = globals()["DeepSequenceModel"]
+    SpatialNeighborModel = globals()["SpatialNeighborModel"]
+    DeepTabularModel = globals()["DeepTabularModel"]
+    TreeEnsembleModel = globals()["TreeEnsembleModel"]
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -43,6 +70,42 @@ OOF_CACHE_PATH = ARTIFACT_DIR / "oof_cache.npz"
 OOF_META_PATH = ARTIFACT_DIR / "oof_cache.json"
 WEIGHTS_PATH = ARTIFACT_DIR / "meta_weights.json"
 SUBMISSION_PATH = ROOT / "submission.csv"
+PIPELINE_CONFIG_PATH = ROOT / "pipeline_config.json"
+
+DEFAULT_PIPELINE_CONFIG: Dict[str, Any] = {
+    "data": {
+        "train_root": "/kaggle/input/competitions/rogii-wellbore-geology-prediction/train",
+        "test_root": "/kaggle/input/competitions/rogii-wellbore-geology-prediction/test",
+        "submission_path": "submission.csv",
+        "max_wells": None,
+        "row_cap": None,
+    },
+    "environment": {
+        "is_notebook_runtime": True,
+    },
+    "active_families": {
+        "tree_models": True,
+        "sequence_models": False,
+        "linear_models": True,
+        "spatial_models": False,
+        "kernel_models": True,
+        "tabular_models": True,
+        "baseline_models": False,
+    },
+    "sub_models": {
+        "run_heavy_baseline_trees": False,
+    },
+}
+
+FAMILY_CONFIG_FLAGS = {
+    "tree": "tree_models",
+    "sequence": "sequence_models",
+    "linear": "linear_models",
+    "spatial": "spatial_models",
+    "kernels": "kernel_models",
+    "tabular": "tabular_models",
+    "baseline": "baseline_models",
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +133,59 @@ PEER_SPECS: Tuple[PeerSpec, ...] = (
     PeerSpec("baseline", "et", "baseline_et"),
     PeerSpec("baseline", "hist", "baseline_hist"),
 )
+
+
+def _deep_merge_dict(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_dict(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_pipeline_config(config_path: str | Path = PIPELINE_CONFIG_PATH) -> Dict[str, Any]:
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = ROOT / path
+
+    loaded: Dict[str, Any] = {}
+    if path.exists():
+        loaded_data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded_data, dict):
+            loaded = loaded_data
+        else:
+            raise ValueError(f"Pipeline config must be a JSON object: {path}")
+
+    return _deep_merge_dict(DEFAULT_PIPELINE_CONFIG, loaded)
+
+
+def _family_is_active(active_families: Mapping[str, Any], family_key: str) -> bool:
+    config_flag = FAMILY_CONFIG_FLAGS[family_key]
+    return bool(active_families.get(config_flag, DEFAULT_PIPELINE_CONFIG["active_families"][config_flag]))
+
+
+def build_active_peer_specs(
+    active_families: Mapping[str, Any],
+    sub_models: Mapping[str, Any],
+) -> Tuple[PeerSpec, ...]:
+    active_specs: List[PeerSpec] = []
+    run_heavy_baseline_trees = bool(
+        sub_models.get(
+            "run_heavy_baseline_trees",
+            DEFAULT_PIPELINE_CONFIG["sub_models"]["run_heavy_baseline_trees"],
+        )
+    )
+
+    for spec in PEER_SPECS:
+        if not _family_is_active(active_families, spec.family):
+            continue
+        if spec.family == "baseline" and not run_heavy_baseline_trees and spec.display_name in {"baseline_rf", "baseline_et"}:
+            continue
+        active_specs.append(spec)
+
+    return tuple(active_specs)
 
 
 class MetaBlender:
@@ -145,11 +261,99 @@ def load_competition_frames(root: str | Path) -> Dict[str, Dict[str, pd.DataFram
     return pipeline.load_directory(root)
 
 
+def _extract_typewell_reference_signal(typewell: pd.DataFrame) -> np.ndarray:
+    if typewell is None or typewell.empty:
+        return np.asarray([], dtype=float)
+
+    preferred_columns = ("GR", "TVT_input", "TVT")
+    for column in preferred_columns:
+        if column in typewell.columns:
+            signal = pd.to_numeric(typewell[column], errors="coerce")
+            break
+    else:
+        numeric = typewell.select_dtypes(include=[np.number])
+        if numeric.empty:
+            return np.asarray([], dtype=float)
+        signal = pd.to_numeric(numeric.iloc[:, 0], errors="coerce")
+
+    signal = signal.interpolate(method="linear", limit_direction="both").ffill().bfill().fillna(0.0)
+    return signal.to_numpy(dtype=float)
+
+
+def _normalized_window_corr(left: Sequence[float], right: Sequence[float]) -> float:
+    left_arr = np.asarray(left, dtype=float).reshape(-1)
+    right_arr = np.asarray(right, dtype=float).reshape(-1)
+    length = min(len(left_arr), len(right_arr))
+    if length < 2:
+        return 0.0
+    left_arr = left_arr[-length:]
+    right_arr = right_arr[-length:]
+    left_std = float(np.nanstd(left_arr))
+    right_std = float(np.nanstd(right_arr))
+    if left_std == 0.0 or right_std == 0.0:
+        return 0.0
+    left_centered = left_arr - np.nanmean(left_arr)
+    right_centered = right_arr - np.nanmean(right_arr)
+    denom = float(np.sqrt(np.sum(left_centered ** 2) * np.sum(right_centered ** 2)))
+    if denom == 0.0 or not np.isfinite(denom):
+        return 0.0
+    return float(np.sum(left_centered * right_centered) / denom)
+
+
+def _add_typewell_reference_features(
+    horizontal: pd.DataFrame,
+    typewell: pd.DataFrame,
+    window_sizes: Sequence[int] = FeaturePipeline.DEFAULT_GR_WINDOWS,
+) -> pd.DataFrame:
+    work = horizontal.copy().reset_index(drop=True)
+    if "GR" in work.columns:
+        gr = pd.to_numeric(work["GR"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    else:
+        gr = np.zeros(len(work), dtype=float)
+
+    ref_signal = _extract_typewell_reference_signal(typewell)
+    if len(work) == 0:
+        for window in window_sizes:
+            work[f"gr_typewell_forward_corr_{window}"] = pd.Series(dtype=float)
+            work[f"gr_typewell_reverse_corr_{window}"] = pd.Series(dtype=float)
+            work[f"gr_typewell_corr_gap_{window}"] = pd.Series(dtype=float)
+        return work
+
+    if ref_signal.size == 0:
+        for window in window_sizes:
+            work[f"gr_typewell_forward_corr_{window}"] = 0.0
+            work[f"gr_typewell_reverse_corr_{window}"] = 0.0
+            work[f"gr_typewell_corr_gap_{window}"] = 0.0
+        return work
+
+    ref_reverse = ref_signal[::-1]
+    n_rows = len(work)
+    denom = max(n_rows - 1, 1)
+
+    for window in window_sizes:
+        window = int(window)
+        forward_corrs: List[float] = []
+        reverse_corrs: List[float] = []
+        for idx in range(n_rows):
+            h_window = gr[max(0, idx - window + 1) : idx + 1]
+            ref_idx = int(round((idx / denom) * max(len(ref_signal) - 1, 0)))
+            forward_slice = ref_signal[max(0, ref_idx - len(h_window) + 1) : ref_idx + 1]
+            reverse_slice = ref_reverse[max(0, ref_idx - len(h_window) + 1) : ref_idx + 1]
+            forward_corrs.append(_normalized_window_corr(h_window, forward_slice))
+            reverse_corrs.append(_normalized_window_corr(h_window, reverse_slice))
+        work[f"gr_typewell_forward_corr_{window}"] = np.asarray(forward_corrs, dtype=float)
+        work[f"gr_typewell_reverse_corr_{window}"] = np.asarray(reverse_corrs, dtype=float)
+        work[f"gr_typewell_corr_gap_{window}"] = work[f"gr_typewell_forward_corr_{window}"] - work[f"gr_typewell_reverse_corr_{window}"]
+
+    return work
+
+
 def build_horizontal_frame(frames: Dict[str, Dict[str, pd.DataFrame]]) -> pd.DataFrame:
     pieces: List[pd.DataFrame] = []
     for wellname, bundle in frames.items():
         horizontal = bundle["horizontal"].copy()
         horizontal["WELLNAME"] = wellname
+        horizontal = _add_typewell_reference_features(horizontal, bundle.get("typewell", pd.DataFrame()))
         pieces.append(horizontal)
     if not pieces:
         raise ValueError("No horizontal well files were found.")
@@ -204,14 +408,32 @@ def _make_light_tree_model(random_state: int = 42) -> TreeEnsembleModel:
     return model
 
 
-def fit_family_models(train_df: pd.DataFrame) -> Dict[str, Any]:
+def _make_baseline_model(active_backends: Sequence[str]) -> BaselineEnsembleModel:
+    model = BaselineEnsembleModel(metrics_path=None)
+    model.BACKEND_ORDER = tuple(active_backends)  # type: ignore[assignment]
+    return model
+
+
+def fit_family_models(
+    train_df: pd.DataFrame,
+    active_families: Mapping[str, Any],
+    sub_models: Mapping[str, Any],
+) -> Dict[str, Any]:
     family_models: Dict[str, Any] = {}
+    run_heavy_baseline_trees = bool(
+        sub_models.get(
+            "run_heavy_baseline_trees",
+            DEFAULT_PIPELINE_CONFIG["sub_models"]["run_heavy_baseline_trees"],
+        )
+    )
+    baseline_backends = ("rf", "et", "hist") if run_heavy_baseline_trees else ("hist",)
 
     family_steps = [
-        ("Family A", "tree", lambda: _make_light_tree_model().fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family A", "tree", "tree_models", lambda: _make_light_tree_model().fit(train_df, train_df["TVT"].to_numpy())),
         (
             "Family B",
             "sequence",
+            "sequence_models",
             lambda: DeepSequenceModel(
                 metrics_path=None,
                 sequence_length=8,
@@ -221,38 +443,53 @@ def fit_family_models(train_df: pd.DataFrame) -> Dict[str, Any]:
                 learning_rate=1e-3,
             ).fit(train_df, train_df["TVT"].to_numpy()),
         ),
-        ("Family D", "spatial", lambda: SpatialNeighborModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
-        ("Family E", "kernels", lambda: KernelMachineModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family D", "spatial", "spatial_models", lambda: SpatialNeighborModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family E", "kernels", "kernel_models", lambda: KernelMachineModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
         (
             "Family F",
             "tabular",
+            "tabular_models",
             lambda: DeepTabularModel(
                 metrics_path=None,
                 hidden_dims=(64, 32),
                 epochs=2,
-                batch_size=64,
+                batch_size=2048,
                 learning_rate=1e-3,
             ).fit(train_df, train_df["TVT"].to_numpy()),
         ),
-        ("Family C", "linear", lambda: LinearEnsembleModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
-        ("Family G", "baseline", lambda: BaselineEnsembleModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family C", "linear", "linear_models", lambda: LinearEnsembleModel(metrics_path=None).fit(train_df, train_df["TVT"].to_numpy())),
+        ("Family G", "baseline", "baseline_models", lambda: _make_baseline_model(baseline_backends).fit(train_df, train_df["TVT"].to_numpy())),
     ]
 
-    with tqdm(total=len(family_steps), desc="Training 7 model families", dynamic_ncols=True) as family_bar:
-        for family_label, family_key, trainer in family_steps:
+    selected_steps = [
+        (family_label, family_key, trainer)
+        for family_label, family_key, config_flag, trainer in family_steps
+        if bool(active_families.get(config_flag, DEFAULT_PIPELINE_CONFIG["active_families"][config_flag]))
+    ]
+
+    if not selected_steps:
+        raise RuntimeError("No model families are active in pipeline_config.json.")
+
+    with tqdm(total=len(selected_steps), desc=f"Training {len(selected_steps)} model families", dynamic_ncols=True) as family_bar:
+        for family_label, family_key, trainer in selected_steps:
             family_bar.set_description(f"Training {family_label}")
+            log_family_training_start(family_label, family_key)
             family_models[family_key] = trainer()
+            log_family_training_complete(family_label)
             family_bar.update(1)
 
     return family_models
 
 
-def collect_peer_oof_matrix(family_models: Dict[str, Any]) -> Tuple[np.ndarray, List[str]]:
+def collect_peer_oof_matrix(family_models: Dict[str, Any], peer_specs: Sequence[PeerSpec]) -> Tuple[np.ndarray, List[str]]:
     columns: List[np.ndarray] = []
     names: List[str] = []
 
-    with tqdm(total=len(PEER_SPECS), desc="Collecting 16 peer OOF columns", dynamic_ncols=True) as peer_bar:
-        for spec in PEER_SPECS:
+    if not peer_specs:
+        raise RuntimeError("No active peer specs are available for blending.")
+
+    with tqdm(total=len(peer_specs), desc=f"Collecting {len(peer_specs)} peer OOF columns", dynamic_ncols=True) as peer_bar:
+        for spec in peer_specs:
             peer_bar.set_description(f"Collecting {spec.display_name}")
             if spec.family == "tree":
                 model = family_models["tree"]
@@ -355,11 +592,14 @@ def predict_family_scaled(model: Any, family_name: str, df: pd.DataFrame) -> np.
     raise KeyError(f"Unknown family '{family_name}'.")
 
 
-def collect_test_peer_matrix(family_models: Dict[str, Any], test_df: pd.DataFrame) -> np.ndarray:
+def collect_test_peer_matrix(family_models: Dict[str, Any], test_df: pd.DataFrame, peer_specs: Sequence[PeerSpec]) -> np.ndarray:
     columns: List[np.ndarray] = []
 
-    with tqdm(total=len(PEER_SPECS), desc="Collecting 16 peer test columns", dynamic_ncols=True) as peer_bar:
-        for spec in PEER_SPECS:
+    if not peer_specs:
+        raise RuntimeError("No active peer specs are available for test prediction.")
+
+    with tqdm(total=len(peer_specs), desc=f"Collecting {len(peer_specs)} peer test columns", dynamic_ncols=True) as peer_bar:
+        for spec in peer_specs:
             peer_bar.set_description(f"Collecting {spec.display_name}")
             if spec.family == "tree":
                 model = family_models["tree"]
@@ -409,7 +649,7 @@ def build_submission_from_predictions(
     return submission
 
 
-def append_metrics(record: Dict[str, Any], metrics_path: str | Path = ROOT / "metrics.json") -> None:
+def append_metrics(record: Dict[str, Any], metrics_path: str | Path = ROOT / "results/metrics.json") -> None:
     path = _resolve_path(metrics_path)
     existing: List[Dict[str, Any]] = []
     if path.exists():
@@ -432,10 +672,17 @@ def run_blending(
     cache_dir: str | Path = ARTIFACT_DIR,
     submission_path: str | Path = SUBMISSION_PATH,
     sample_submission_path: str | Path = ROOT / "data" / "sample_submission.csv",
-    max_wells: Optional[int] = 6,
-    row_cap: Optional[int] = 500,
+    max_wells: Optional[int] = None,
+    row_cap: Optional[int] = None,
     force_recompute_cache: bool = False,
+    active_families: Optional[Mapping[str, Any]] = None,
+    sub_models: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    active_families = dict(DEFAULT_PIPELINE_CONFIG["active_families"] if active_families is None else active_families)
+    sub_models = dict(DEFAULT_PIPELINE_CONFIG["sub_models"] if sub_models is None else sub_models)
+    peer_specs = build_active_peer_specs(active_families, sub_models)
+    expected_peer_names = [spec.display_name for spec in peer_specs]
+
     train_root = _resolve_path(train_root)
     test_root = _resolve_path(test_root)
     cache_dir = _resolve_path(cache_dir)
@@ -454,23 +701,28 @@ def run_blending(
 
     cached = None if force_recompute_cache else load_oof_cache(cache_dir)
     if cached is None:
-        family_models = fit_family_models(train_df)
-        oof_matrix, peer_names = collect_peer_oof_matrix(family_models)
+        family_models = fit_family_models(train_df, active_families=active_families, sub_models=sub_models)
+        oof_matrix, peer_names = collect_peer_oof_matrix(family_models, peer_specs)
         save_oof_cache(cache_dir, oof_matrix, target_scaled, peer_names)
     else:
         oof_matrix, cached_target_scaled, peer_names = cached
         if len(cached_target_scaled) == len(target_scaled):
             target_scaled = cached_target_scaled
-        family_models = fit_family_models(train_df)
-        if oof_matrix.shape[0] != len(train_df):
-            oof_matrix, peer_names = collect_peer_oof_matrix(family_models)
+        family_models = fit_family_models(train_df, active_families=active_families, sub_models=sub_models)
+        cache_matches = (
+            oof_matrix.shape[0] == len(train_df)
+            and oof_matrix.shape[1] == len(expected_peer_names)
+            and peer_names == expected_peer_names
+        )
+        if not cache_matches:
+            oof_matrix, peer_names = collect_peer_oof_matrix(family_models, peer_specs)
             save_oof_cache(cache_dir, oof_matrix, target_scaled, peer_names)
 
     blender = MetaBlender()
     blender.fit(oof_matrix, target_scaled, peer_names=peer_names)
 
     test_df = build_horizontal_frame(test_frames)
-    test_oof_matrix = collect_test_peer_matrix(family_models, test_df)
+    test_oof_matrix = collect_test_peer_matrix(family_models, test_df, peer_specs)
     blended_scaled = blender.predict(test_oof_matrix)
     blended = target_pipeline.inverse_transform_target(blended_scaled)
 
@@ -499,7 +751,7 @@ def run_blending(
         "submission_path": str(Path(submission_path).resolve()),
         "cache_dir": str(Path(cache_dir).resolve()),
     }
-    append_metrics(metrics_record, metrics_path=ROOT / "metrics.json")
+    append_metrics(metrics_record, metrics_path=ROOT / "results/metrics.json")
 
     return {
         "family_models": family_models,
@@ -510,22 +762,25 @@ def run_blending(
     }
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None, config: Optional[Mapping[str, Any]] = None) -> argparse.Namespace:
+    pipeline_config = load_pipeline_config() if config is None else config
+    data_config = pipeline_config["data"]
     parser = argparse.ArgumentParser(description="Optimize stacked ensemble weights and write submission.csv.")
-    parser.add_argument("--train-root", default=str(ROOT / "data" / "train"))
-    parser.add_argument("--test-root", default=str(ROOT / "data" / "test"))
+    parser.add_argument("--train-root", default=str(data_config["train_root"]))
+    parser.add_argument("--test-root", default=str(data_config["test_root"]))
     parser.add_argument("--cache-dir", default=str(ARTIFACT_DIR))
-    parser.add_argument("--submission-path", default=str(SUBMISSION_PATH))
+    parser.add_argument("--submission-path", default=str(data_config["submission_path"]))
     parser.add_argument("--sample-submission-path", default=str(ROOT / "data" / "sample_submission.csv"))
-    parser.add_argument("--max-wells", type=int, default=6)
-    parser.add_argument("--row-cap", type=int, default=500)
+    parser.add_argument("--max-wells", type=int, default=data_config["max_wells"] if data_config["max_wells"] is None else int(data_config["max_wells"]))
+    parser.add_argument("--row-cap", type=int, default=data_config["row_cap"] if data_config["row_cap"] is None else int(data_config["row_cap"]))
     parser.add_argument("--force-recompute-cache", action="store_true")
     parser.add_argument("--full", action="store_true", help="Disable the interactive fast-debug limits.")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    pipeline_config = load_pipeline_config()
+    args = parse_args(argv, config=pipeline_config)
     result = run_blending(
         train_root=args.train_root,
         test_root=args.test_root,
@@ -535,6 +790,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_wells=None if args.full else args.max_wells,
         row_cap=None if args.full else args.row_cap,
         force_recompute_cache=args.force_recompute_cache,
+        active_families=pipeline_config["active_families"],
+        sub_models=pipeline_config["sub_models"],
     )
 
     summary = {

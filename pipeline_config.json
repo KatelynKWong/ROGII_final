@@ -1,0 +1,24 @@
+{
+  "data": {
+    "train_root": "/kaggle/input/competitions/rogii-wellbore-geology-prediction/train",
+    "test_root": "/kaggle/input/competitions/rogii-wellbore-geology-prediction/test",
+    "submission_path": "submission.csv",
+    "max_wells": null,
+    "row_cap": null
+  },
+  "environment": {
+    "is_notebook_runtime": true
+  },
+  "active_families": {
+    "tree_models": true,
+    "sequence_models": false,
+    "linear_models": true,
+    "spatial_models": false,
+    "kernel_models": true,
+    "tabular_models": true,
+    "baseline_models": false
+  },
+  "sub_models": {
+    "run_heavy_baseline_trees": false
+  }
+}
